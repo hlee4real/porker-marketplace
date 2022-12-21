@@ -1,220 +1,178 @@
 module admin::marketplace {
-    use std::signer;
-    use std::string;
-
-    use aptos_token::token;
-
-    use aptos_std::table::{Self, Table};
-
     use aptos_framework::coin;
-    use aptos_framework::timestamp;
+    use aptos_framework::table::{Self, Table};
+    use aptos_framework::guid;
+    use aptos_token::token;
+    use aptos_token::token_coin_swap::{ list_token_for_swap, exchange_coin_for_token };
+    use std::string::String;
+    use std::signer;
     use aptos_framework::account;
-    use aptos_framework::event;
+    use aptos_framework::timestamp;
+    use aptos_std::event::{Self, EventHandle};    
 
-    const E_ITEM_ALREADY_EXISTS: u64 = 0;
-    const E_COLLECTION_ITEM_ALREADY_EXISTS: u64 = 10;
-    const E_SELLER_DOESNT_OWN_TOKEN: u64 = 1;
-    const E_INVALID_BALANCE: u64 = 2;
-    const E_ITEM_NOT_LISTED: u64 = 3;
-    const E_AUCTION_ITEM_DOES_NOT_EXIST: u64 = 4;
-    const E_LISTING_IS_CLOSED: u64 = 5;
-    const E_INSUFFICIENT_BALANCE: u64 = 6;
-    const E_RESOURCE_NOT_DESTROYED: u64 = 7;
-    const E_SELLER_STILL_OWNS_TOKEN: u64 = 8;
-    const E_BUYER_DOESNT_OWN_TOKEN: u64 = 9;
-
-    struct Item<phantom CoinType> has store {
-        list_price: u64,
-        end_time: u64,
-        token: token::TokenId,
-        withdrawCapability: token::WithdrawCapability,
+    struct MarketId has store, drop, copy{
+        market_name: String,
+        market_address: address,
     }
 
-    struct CreateListingEvent has store, drop {
-        listing_price: u64,
-        end_time: u64,
-        start_time: u64,
+    struct Market has key {
+        market_id: MarketId,
+        signer_cap: account::SignerCapability,
+    }
+
+    struct MarketEvents has key {
+        create_market_event: EventHandle<CreateMarketEvent>,
+        list_token_event: EventHandle<ListTokenEvent>,
+        buy_token_event: EventHandle<BuyTokenEvent>,
+    }
+
+    struct OfferStore has key {
+        offers: Table<token::TokenId, Offer>
+    }
+
+    struct Offer has drop, store {
+        market_id : MarketId,
         seller: address,
-        token: token::TokenId,
+        price: u64,
     }
 
-    struct CancelEvent has store, drop {
-        listing_price: u64,
-        cancel_time: u64,
+    struct CreateMarketEvent has drop, store {
+        market_id: MarketId,
+    }
+
+    struct ListTokenEvent has drop, store {
+        market_id: MarketId,
+        token_id: token::TokenId,
         seller: address,
-        token: token::TokenId,
+        price: u64,
+        timestamp: u64,
+        offer_id: u64
     }
 
-    struct BuyEvent has store, drop {
-        buy_price: u64,
-        buy_time: u64,
+    struct BuyTokenEvent has drop, store {
+        market_id: MarketId,
+        token_id: token::TokenId,
         seller: address,
         buyer: address,
-        token: token::TokenId,
+        price: u64,
+        timestamp: u64,
+        offer_id: u64
     }
 
-    struct ListingItem<phantom CoinType> has key {
-        items: Table<token::TokenId, Item<CoinType>>
+    //lay ra resource account
+    fun get_resource_account_cap(market_address: address) : signer acquires Market {
+        let market = borrow_global<Market>(market_address);
+        account::create_signer_with_capability(&market.signer_cap)
     }
 
-    struct ListingEvents has key {
-        create_listing: event::EventHandle<CreateListingEvent>,
-        cancel_listing: event::EventHandle<CancelEvent>,
-        complete_listing: event::EventHandle<BuyEvent>,
-    }
-
-    public entry fun list_nft<CoinType>(sender: &signer, creator: address, collection_name: vector<u8>, token_name: vector<u8>, list_price: u64, expiration_time: u64, property_version:u64) acquires ListingItem, ListingEvents {
+    //init market va tao resource account, deposit coin vao resource account 
+    public entry fun init_market<CoinType>(sender: &signer, market_name: String, initial_fund: u64) acquires MarketEvents, Market {
         let sender_addr = signer::address_of(sender);
-        let token_id = token::create_token_id_raw(creator, string::utf8(collection_name), string::utf8(token_name), property_version);
-        assert!(!exists<ListingItem<CoinType>>(sender_addr), E_ITEM_ALREADY_EXISTS);
-        assert!(token::balance_of(sender_addr, token_id) > 0, E_SELLER_DOESNT_OWN_TOKEN);
+        //market id la market name va market address
+        //market address la address cua sender luc init market
+        let market_id = MarketId { market_name, market_address: sender_addr };
 
-        let start_time = timestamp::now_microseconds();
-        let end_time = expiration_time + start_time;
-
-        let withdrawCapability = token::create_withdraw_capability(sender, token_id, 1, end_time);
-        let item = Item {
-            list_price,
-            end_time,
-            token: token_id,
-            withdrawCapability,
-        };
-        if (exists<ListingItem<CoinType>>(sender_addr)){
-            let list_items = borrow_global_mut<ListingItem<CoinType>>(sender_addr);
-            table::add(&mut list_items.items, token_id, item);
-        }else {
-            let new_item = table::new();
-            table::add(&mut new_item, token_id, item);
-            move_to<ListingItem<CoinType>>(sender, 
-                ListingItem { items: new_item }
-            );
-        };
-        let create_listing_event = CreateListingEvent {
-            listing_price: list_price,
-            end_time,
-            start_time,
-            seller: sender_addr,
-            token: token_id,
-        };
-        if (exists<ListingEvents>(sender_addr)){
-            let auction_events = borrow_global_mut<ListingEvents>(sender_addr);
-            event::emit_event<CreateListingEvent>(
-                &mut auction_events.create_listing,
-                create_listing_event,
-            );
-        }else {
-            move_to<ListingEvents>(sender, ListingEvents{
-                create_listing: account::new_event_handle<CreateListingEvent>(sender),
-                cancel_listing: account::new_event_handle<CancelEvent>(sender),
-                complete_listing: account::new_event_handle<BuyEvent>(sender),
+        //neu chua co market event nao duoc tao thi se duoc tao va luu tren storage voi move_to
+        if(!exists<MarketEvents>(sender_addr)) {
+            move_to(sender, MarketEvents{
+                create_market_event: account::new_event_handle<CreateMarketEvent>(sender),
+                list_token_event: account::new_event_handle<ListTokenEvent>(sender),
+                buy_token_event: account::new_event_handle<BuyTokenEvent>(sender)
             });
-            let auction_events = borrow_global_mut<ListingEvents>(sender_addr);
-            event::emit_event<CreateListingEvent>(
-                &mut auction_events.create_listing,
-                create_listing_event,
-            );
+        };
+
+        //neu chua tao offer nao thi se tao 1 cai table offer moi
+        if(!exists<OfferStore>(sender_addr)) {
+            move_to(sender, OfferStore{
+                offers: table::new()
+            });
+        };
+
+        //neu chua co market nao duoc tao thi se duoc tao va luu tren storage voi move_to
+        if(!exists<Market>(sender_addr)) { 
+            let (resource_signer, signer_cap) = account::create_resource_account(sender, x"01");
+            token::initialize_token_store(&resource_signer);
+            move_to(sender, Market{
+                market_id, signer_cap
+            });
+            let market_events = borrow_global_mut<MarketEvents>(sender_addr);
+            event::emit_event(&mut market_events.create_market_event, CreateMarketEvent{ market_id });
+        };
+
+        //lay ra resource account
+        let resource_signer = get_resource_account_cap(sender_addr);
+
+        //neu chua dang ky coin thi se dang ky coin
+        if(!coin::is_account_registered<CoinType>(signer::address_of(&resource_signer))) {
+            coin::register<CoinType>(&resource_signer);
+        };
+
+        //neu initial_fund > 0 thi se deposit coin vao resource account
+        if(initial_fund > 0) {
+            coin::transfer<CoinType>(sender, signer::address_of(&resource_signer), initial_fund);
         };
     }
 
-    public entry fun buy_token<CoinType>(buyer: &signer, seller: address, creator: address, collection_name: vector<u8>, token_name: vector<u8>, property_version: u64) acquires ListingItem, ListingEvents{
-        assert!(exists<ListingItem<CoinType>>(seller), E_AUCTION_ITEM_DOES_NOT_EXIST);
+    public entry fun list_token<CoinType>(seller: &signer, market_address:address, market_name: String, creator: address, collection: String, name: String, property_version: u64, price: u64) acquires MarketEvents, Market, OfferStore {
+        let market_id = MarketId { market_name, market_address };
+        //lay resource account tu market address ra vi luc init market resource account gan voi market address
+        let resource_signer = get_resource_account_cap(market_address);
+        let seller_addr = signer::address_of(seller);
+        //tao ra token id
+        let token_id = token::create_token_id_raw(creator, collection, name, property_version);
+        //rut token
+        let token = token::withdraw_token(seller, token_id, 1);
 
+        //deposit token vao resource account.
+        token::deposit_token(&resource_signer, token);
+        //dung aptos_token::list_token_for_swap de list token
+        list_token_for_swap<CoinType>(&resource_signer, creator, collection, name, property_version, 1, price, 0);
+        //lay ra offer store tu struct OfferStore
+        let offer_store = borrow_global_mut<OfferStore>(market_address);
+        //them offer store vao table, offer store gom co market_id - market name va address, seller address, price
+        table::add(&mut offer_store.offers, token_id, Offer {
+            market_id, seller: seller_addr, price
+        });
+
+        //tao guid cho resource account
+        let guid = account::create_guid(&resource_signer);
+        //lay ra market event tu struct MarketEvents
+        let market_events = borrow_global_mut<MarketEvents>(market_address);
+        //emit event list token
+        event::emit_event(&mut market_events.list_token_event, ListTokenEvent{
+            market_id, 
+            token_id, 
+            seller: seller_addr, 
+            price, 
+            timestamp: timestamp::now_microseconds(),
+            offer_id: guid::creation_num(&guid)
+        });
+    }
+
+    public entry fun buy_token<CoinType>(buyer: &signer, market_address: address, market_name: String, creator: address, collection: String, name: String, property_version: u64, price: u64, offer_id: u64) acquires MarketEvents, Market, OfferStore {
+        let market_id = MarketId { market_name, market_address };
+        let token_id = token::create_token_id_raw(creator, collection, name, property_version);
+        let offer_store = borrow_global_mut<OfferStore>(market_address);
+        let seller = table::borrow(&offer_store.offers, token_id).seller;
         let buyer_addr = signer::address_of(buyer);
-        let token_id = token::create_token_id_raw(creator, string::utf8(collection_name), string::utf8(token_name), property_version);
-        let listing_items = borrow_global_mut<ListingItem<CoinType>>(seller);
-        let listing_item = table::borrow_mut(&mut listing_items.items, token_id);
 
-        let current_time = timestamp::now_microseconds();
-        assert!(current_time < listing_item.end_time, E_LISTING_IS_CLOSED);
+        let resource_signer = get_resource_account_cap(market_address);
+        //dung aptos_token::exchange_coin_for_token de doi coin thanh token (buy token), deposit coin vao resource account
+        exchange_coin_for_token<CoinType>(buyer, price, signer::address_of(&resource_signer), creator, collection, name, property_version, 1);
 
-        assert!(token::balance_of(seller, listing_item.token) > 0, E_SELLER_DOESNT_OWN_TOKEN);
-        assert!(coin::balance<CoinType>(buyer_addr) > listing_item.list_price, E_INSUFFICIENT_BALANCE);
-
-        token::opt_in_direct_transfer(buyer, true);
-
-        let list = table::remove(&mut listing_items.items, token_id);
-
-        let Item<CoinType> {
-            list_price: price,
-            end_time: _,
-            token: _,
-            withdrawCapability: withdrawCapability,
-        } = list;
-
-        coin::transfer<CoinType>(buyer, seller, price);
-
-        let token = token::withdraw_with_capability(withdrawCapability);
-        token::direct_deposit_with_opt_in(buyer_addr, token);
-        let complete_listing_event = BuyEvent {
-            buy_price: price,
-            buy_time: current_time,
+        //chuyen tien cho seller tu resource account
+        coin::transfer<CoinType>(&resource_signer, seller, price);
+        table::remove(&mut offer_store.offers, token_id);
+        
+        let market_events = borrow_global_mut<MarketEvents>(market_address);
+        event::emit_event(&mut market_events.buy_token_event, BuyTokenEvent{
+            market_id,
+            token_id,
             seller,
             buyer: buyer_addr,
-            token: token_id,
-        };
-        if (exists<ListingEvents>(buyer_addr)) {
-            let auction_events = borrow_global_mut<ListingEvents>(buyer_addr);
-            event::emit_event<BuyEvent>(
-                &mut auction_events.complete_listing,
-                complete_listing_event,
-            );
-        } else {
-            move_to<ListingEvents>(buyer, ListingEvents{
-                create_listing: account::new_event_handle<CreateListingEvent>(buyer),
-                cancel_listing: account::new_event_handle<CancelEvent>(buyer),
-                complete_listing: account::new_event_handle<BuyEvent>(buyer),
-            });
-            let auction_events = borrow_global_mut<ListingEvents>(buyer_addr);
-            event::emit_event<BuyEvent>(
-                &mut auction_events.complete_listing,
-                complete_listing_event,
-            );
-        };
+            price,
+            timestamp: timestamp::now_microseconds(),
+            offer_id,
+        });
     }
-
-    public fun cancel_listing<CoinType>(seller: &signer, creator: address, collection_name: vector<u8>, token_name: vector<u8>, property_version: u64) acquires ListingEvents, ListingItem {
-        let seller_addr = signer::address_of(seller);
-        assert!(exists<ListingItem<CoinType>>(seller_addr), E_AUCTION_ITEM_DOES_NOT_EXIST);
-
-        let token_id = token::create_token_id_raw(creator, string::utf8(collection_name), string::utf8(token_name), property_version);
-        let listing_items = borrow_global_mut<ListingItem<CoinType>>(seller_addr);
-        let listing_item = table::borrow_mut(&mut listing_items.items, token_id);
-
-        assert!(token::balance_of(seller_addr, listing_item.token) > 0, E_SELLER_DOESNT_OWN_TOKEN);
-
-        let list = table::remove(&mut listing_items.items, token_id);
-
-        let Item<CoinType> {
-            list_price: price,
-            end_time: _,
-            token: _,
-            withdrawCapability: _,
-        } = list;
-
-        let cancel_listing_event = CancelEvent {
-            listing_price: price,
-            cancel_time: timestamp::now_microseconds(),
-            seller: seller_addr,
-            token: token_id,
-        };
-        if (exists<ListingEvents>(seller_addr)){
-            let auction_events = borrow_global_mut<ListingEvents>(seller_addr);
-            event::emit_event<CancelEvent>(
-                &mut auction_events.cancel_listing,
-                cancel_listing_event,
-            );
-        } else {
-            move_to<ListingEvents>(seller, ListingEvents{
-                create_listing: account::new_event_handle<CreateListingEvent>(seller),
-                cancel_listing: account::new_event_handle<CancelEvent>(seller),
-                complete_listing: account::new_event_handle<BuyEvent>(seller),
-            });
-            let auction_events = borrow_global_mut<ListingEvents>(seller_addr);
-            event::emit_event<CancelEvent>(
-                &mut auction_events.cancel_listing,
-                cancel_listing_event,
-            );
-        };
-    }
-
 }

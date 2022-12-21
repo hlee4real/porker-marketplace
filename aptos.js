@@ -1,10 +1,15 @@
 const { AptosClient, AptosAccount, CoinClient, TokenClient } = require("aptos")
 const NODE_URL = process.env.APTOS_NODE_URL || "https://fullnode.devnet.aptoslabs.com";
-const FAUCET_URL = process.env.APTOS_FAUCET_URL || "https://faucet.devnet.aptoslabs.com";
 const client = new AptosClient(NODE_URL);
 const coinClient = new CoinClient(client);
 const tokenClient = new TokenClient(client);
+const address = "0x13875ee636300ec7031d1eefc82591b23263ea3665f870fb31abfd4fd713c779";
+const publicKey = "0x4fb19492921943e7719f2120e96a7b319ad46ce9496cf6e5156e78a307eb9065";
+const privateKey = "f0fc818d9cfaef94b1c93f5827b9ac5f4837cfb3e6f46fce1c9763c091e567a0";
 
+const address2 = "0xd8e1260c2b70f7ff1f63c733e3419c6c0e9f11ec2203b07eced675e878fdefb4"
+const publicKey2 = "0x53aa5b6c2123b86730606ea74df409f2bb0a1616d62fa62766d4809f876ca292"
+const privateKey2 = "0x695dae9935a24c8a8ae6b59eb036a18fcc9322e28c992c2b940f15ef8f6cd69c"
 let myWallet = AptosAccount.fromAptosAccountObject({
     address: address,
     publicKeyHex: publicKey,

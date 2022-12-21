@@ -1,9 +1,0 @@
-[package]
-name = 'porkercoin'
-version = '1.0.0'
-[dependencies.AptosFramework]
-git = 'https://github.com/aptos-labs/aptos-core.git'
-rev = 'main'
-subdir = 'aptos-move/framework/aptos-framework'
-[addresses]
-admin = '13875ee636300ec7031d1eefc82591b23263ea3665f870fb31abfd4fd713c779'
