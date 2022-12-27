@@ -1,178 +1,369 @@
 module admin::marketplace {
-    use aptos_framework::coin;
-    use aptos_framework::table::{Self, Table};
-    use aptos_framework::guid;
-    use aptos_token::token;
-    use aptos_token::token_coin_swap::{ list_token_for_swap, exchange_coin_for_token };
-    use std::string::String;
-    use std::signer;
-    use aptos_framework::account;
+    use aptos_framework::coin::{Self};
     use aptos_framework::timestamp;
-    use aptos_std::event::{Self, EventHandle};    
+    use aptos_framework::account;
+    use aptos_framework::account::SignerCapability;
+    use aptos_framework::guid;
 
-    struct MarketId has store, drop, copy{
-        market_name: String,
-        market_address: address,
+    use std::signer;
+    use std::option::{Self, Option};
+    use std::string::String;
+    use std::vector;
+    use aptos_std::event::{Self, EventHandle};
+    use aptos_std::table::{Self, Table};
+
+    use aptos_token::token::{Self, Token, TokenId};
+
+    // ---------------------------------------------
+    // ERRORs
+
+    const ERROR: u64 = 0;
+    const ERROR_INVALID_BUYER: u64 = 1;
+    const ERROR_INVALID_OWNER:u64 = 2;
+    const ERROR_NOT_ENOUGH_LENGTH:u64 = 3;
+
+    //TokenCap is a struct that holds a SignerCapability for a token
+    struct TokenCap has key {
+        cap: SignerCapability,
     }
 
-    struct Market has key {
-        market_id: MarketId,
-        signer_cap: account::SignerCapability,
+    //MarketData is a struct that holds the fee and the fund address for a market
+    struct MarketData has key {
+        fee: u64,
+        fund_address: address
     }
 
-    struct MarketEvents has key {
-        create_market_event: EventHandle<CreateMarketEvent>,
-        list_token_event: EventHandle<ListTokenEvent>,
-        buy_token_event: EventHandle<BuyTokenEvent>,
-    }
-
-    struct OfferStore has key {
-        offers: Table<token::TokenId, Offer>
-    }
-
-    struct Offer has drop, store {
-        market_id : MarketId,
-        seller: address,
-        price: u64,
-    }
-
-    struct CreateMarketEvent has drop, store {
-        market_id: MarketId,
-    }
-
-    struct ListTokenEvent has drop, store {
-        market_id: MarketId,
-        token_id: token::TokenId,
-        seller: address,
-        price: u64,
+    // Set of data sent to the event stream during a listing of a token (for fixed price)
+    struct ListEvent has drop, store {
+        id: TokenId,
+        amount: u64,
         timestamp: u64,
-        offer_id: u64
+        listing_id: u64,
+        seller_address: address,
+        royalty_payee: address,
+        royalty_numerator: u64,
+        royalty_denominator: u64
     }
 
-    struct BuyTokenEvent has drop, store {
-        market_id: MarketId,
-        token_id: token::TokenId,
-        seller: address,
-        buyer: address,
-        price: u64,
+    // Set of data sent to the event stream during a delisting of a token 
+    struct DelistEvent has drop, store {
+        id: TokenId,
         timestamp: u64,
-        offer_id: u64
+        listing_id: u64,
+        amount: u64,
+        seller_address: address,
     }
 
-    //lay ra resource account
-    fun get_resource_account_cap(market_address: address) : signer acquires Market {
-        let market = borrow_global<Market>(market_address);
-        account::create_signer_with_capability(&market.signer_cap)
+    // Set of data sent to the event stream during a buying of a token (for fixed price)
+    struct BuyEvent has drop, store {
+        id: TokenId,
+        timestamp: u64,
+        listing_id: u64,
+        seller_address: address,
+        buyer_address: address
     }
 
-    //init market va tao resource account, deposit coin vao resource account 
-    public entry fun init_market<CoinType>(sender: &signer, market_name: String, initial_fund: u64) acquires MarketEvents, Market {
+    //Listed Item is a struct that holds the data for a listed item
+    struct ListedItem has store {
+        amount: u64,
+        timestamp: u64,
+        listing_id: u64,
+        locked_token: Option<Token>,
+        seller_address: address
+    }
+
+    struct ChangePriceEvent has drop, store {
+        id: TokenId,
+        amount: u64,
+        listing_id: u64,
+        timestamp: u64,
+        seller_address: address,
+    }
+
+    struct ListedItemsData has key {
+        listed_items: Table<TokenId, ListedItem>,
+        listing_events: EventHandle<ListEvent>,
+        buying_events: EventHandle<BuyEvent>,
+        delisting_events: EventHandle<DelistEvent>,
+        changing_price_events: EventHandle<ChangePriceEvent>
+    }
+
+
+    // public contract && initial resource account
+    public entry fun initial_market_script(sender: &signer) {
         let sender_addr = signer::address_of(sender);
-        //market id la market name va market address
-        //market address la address cua sender luc init market
-        let market_id = MarketId { market_name, market_address: sender_addr };
+        let (market_signer, market_cap) = account::create_resource_account(sender, x"01");
+        let market_signer_address = signer::address_of(&market_signer);
 
-        //neu chua co market event nao duoc tao thi se duoc tao va luu tren storage voi move_to
-        if(!exists<MarketEvents>(sender_addr)) {
-            move_to(sender, MarketEvents{
-                create_market_event: account::new_event_handle<CreateMarketEvent>(sender),
-                list_token_event: account::new_event_handle<ListTokenEvent>(sender),
-                buy_token_event: account::new_event_handle<BuyTokenEvent>(sender)
+        assert!(sender_addr == @admin, ERROR_INVALID_OWNER);
+
+        if(!exists<TokenCap>(@admin)){
+            move_to(sender, TokenCap {
+                cap: market_cap
+            })
+        };
+
+        if (!exists<MarketData>(market_signer_address)){
+            move_to(&market_signer, MarketData {
+                fee: 200,
+                fund_address: sender_addr
+            })
+        };
+
+        if (!exists<ListedItemsData>(market_signer_address)) {
+            move_to(&market_signer, ListedItemsData {
+                listed_items:table::new<TokenId, ListedItem>(),
+                listing_events: account::new_event_handle<ListEvent>(&market_signer),
+                buying_events: account::new_event_handle<BuyEvent>(&market_signer),
+                delisting_events: account::new_event_handle<DelistEvent>(&market_signer),
+                changing_price_events: account::new_event_handle<ChangePriceEvent>(&market_signer)
             });
         };
 
-        //neu chua tao offer nao thi se tao 1 cai table offer moi
-        if(!exists<OfferStore>(sender_addr)) {
-            move_to(sender, OfferStore{
-                offers: table::new()
-            });
-        };
-
-        //neu chua co market nao duoc tao thi se duoc tao va luu tren storage voi move_to
-        if(!exists<Market>(sender_addr)) { 
-            let (resource_signer, signer_cap) = account::create_resource_account(sender, x"01");
-            token::initialize_token_store(&resource_signer);
-            move_to(sender, Market{
-                market_id, signer_cap
-            });
-            let market_events = borrow_global_mut<MarketEvents>(sender_addr);
-            event::emit_event(&mut market_events.create_market_event, CreateMarketEvent{ market_id });
-        };
-
-        //lay ra resource account
-        let resource_signer = get_resource_account_cap(sender_addr);
-
-        //neu chua dang ky coin thi se dang ky coin
-        if(!coin::is_account_registered<CoinType>(signer::address_of(&resource_signer))) {
-            coin::register<CoinType>(&resource_signer);
-        };
-
-        //neu initial_fund > 0 thi se deposit coin vao resource account
-        if(initial_fund > 0) {
-            coin::transfer<CoinType>(sender, signer::address_of(&resource_signer), initial_fund);
-        };
     }
 
-    public entry fun list_token<CoinType>(seller: &signer, market_address:address, market_name: String, creator: address, collection: String, name: String, property_version: u64, price: u64) acquires MarketEvents, Market, OfferStore {
-        let market_id = MarketId { market_name, market_address };
-        //lay resource account tu market address ra vi luc init market resource account gan voi market address
-        let resource_signer = get_resource_account_cap(market_address);
-        let seller_addr = signer::address_of(seller);
-        //tao ra token id
-        let token_id = token::create_token_id_raw(creator, collection, name, property_version);
-        //rut token
-        let token = token::withdraw_token(seller, token_id, 1);
+    //internal function for list token
+    fun list_token(
+        sender: &signer,
+        token_id: TokenId,
+        price: u64,
+    ) acquires ListedItemsData, TokenCap {
+        let sender_addr = signer::address_of(sender);
+        let market_cap = &borrow_global<TokenCap>(@admin).cap;
+        let market_signer = &account::create_signer_with_capability(market_cap);
+        let market_signer_address = signer::address_of(market_signer);
 
-        //deposit token vao resource account.
-        token::deposit_token(&resource_signer, token);
-        //dung aptos_token::list_token_for_swap de list token
-        list_token_for_swap<CoinType>(&resource_signer, creator, collection, name, property_version, 1, price, 0);
-        //lay ra offer store tu struct OfferStore
-        let offer_store = borrow_global_mut<OfferStore>(market_address);
-        //them offer store vao table, offer store gom co market_id - market name va address, seller address, price
-        table::add(&mut offer_store.offers, token_id, Offer {
-            market_id, seller: seller_addr, price
-        });
+        let token = token::withdraw_token(sender, token_id, 1);
+        let listed_items_data = borrow_global_mut<ListedItemsData>(market_signer_address);
+        let listed_items = &mut listed_items_data.listed_items;
 
-        //tao guid cho resource account
-        let guid = account::create_guid(&resource_signer);
-        //lay ra market event tu struct MarketEvents
-        let market_events = borrow_global_mut<MarketEvents>(market_address);
-        //emit event list token
-        event::emit_event(&mut market_events.list_token_event, ListTokenEvent{
-            market_id, 
-            token_id, 
-            seller: seller_addr, 
-            price, 
-            timestamp: timestamp::now_microseconds(),
-            offer_id: guid::creation_num(&guid)
-        });
+        let royalty = token::get_royalty(token_id);
+        let royalty_payee = token::get_royalty_payee(&royalty);
+        let royalty_numerator = token::get_royalty_numerator(&royalty);
+        let royalty_denominator = token::get_royalty_denominator(&royalty);
+
+        // get unique id
+        let guid = account::create_guid(market_signer);
+        let listing_id = guid::creation_num(&guid);
+
+        event::emit_event<ListEvent>(
+            &mut listed_items_data.listing_events,
+            ListEvent { 
+                id: token_id,
+                amount: price,
+                seller_address: sender_addr,
+                timestamp: timestamp::now_seconds(),
+                listing_id,
+                royalty_payee,
+                royalty_numerator,
+                royalty_denominator 
+            },
+        );
+
+        table::add(listed_items, token_id, ListedItem {
+            amount: price,
+            listing_id,
+            timestamp: timestamp::now_seconds(),
+            locked_token: option::some(token),
+            seller_address: sender_addr
+        })
     }
 
-    public entry fun buy_token<CoinType>(buyer: &signer, market_address: address, market_name: String, creator: address, collection: String, name: String, property_version: u64, price: u64, offer_id: u64) acquires MarketEvents, Market, OfferStore {
-        let market_id = MarketId { market_name, market_address };
-        let token_id = token::create_token_id_raw(creator, collection, name, property_version);
-        let offer_store = borrow_global_mut<OfferStore>(market_address);
-        let seller = table::borrow(&offer_store.offers, token_id).seller;
-        let buyer_addr = signer::address_of(buyer);
+    // entry batch list script by token owners
+    public entry fun batch_list_token(
+        sender: &signer,
+        creators: vector<address>,
+        collection_names: vector<String>,
+        token_names: vector<String>,
+        property_versions: vector<u64>,
+        prices: vector<u64>
+    ) acquires ListedItemsData, TokenCap {
 
-        let resource_signer = get_resource_account_cap(market_address);
-        //dung aptos_token::exchange_coin_for_token de doi coin thanh token (buy token), deposit coin vao resource account
-        exchange_coin_for_token<CoinType>(buyer, price, signer::address_of(&resource_signer), creator, collection, name, property_version, 1);
+        let length_creators = vector::length(&creators);
+        let length_collections = vector::length(&collection_names);
+        let length_token_names = vector::length(&token_names);
+        let length_prices = vector::length(&prices);
+        let length_properties = vector::length(&property_versions);
 
-        //chuyen tien cho seller tu resource account
-        coin::transfer<CoinType>(&resource_signer, seller, price);
-        table::remove(&mut offer_store.offers, token_id);
-        
-        let market_events = borrow_global_mut<MarketEvents>(market_address);
-        event::emit_event(&mut market_events.buy_token_event, BuyTokenEvent{
-            market_id,
-            token_id,
-            seller,
-            buyer: buyer_addr,
-            price,
-            timestamp: timestamp::now_microseconds(),
-            offer_id,
-        });
+        assert!(length_collections == length_creators
+            && length_creators == length_token_names
+            && length_token_names == length_prices
+            && length_prices == length_properties, ERROR_NOT_ENOUGH_LENGTH);
+
+        let i = length_properties;
+
+        while (i > 0) {
+            //get the last element from vectors
+            let creator = vector::pop_back(&mut creators);
+            let token_name = vector::pop_back(&mut token_names);
+            let collection_name = vector::pop_back(&mut collection_names);
+            let price = vector::pop_back(&mut prices);
+            let property_version = vector::pop_back(&mut property_versions);
+
+            let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
+
+            list_token(sender, token_id, price);
+
+            i = i - 1;
+        }
     }
+    // delist token
+    fun delist_token(
+        sender: &signer,
+        token_id: TokenId
+    ) acquires ListedItemsData, TokenCap {
+        let sender_addr = signer::address_of(sender);
+        let market_cap = &borrow_global<TokenCap>(@admin).cap;
+        let market_signer = &account::create_signer_with_capability(market_cap);
+        let market_signer_address = signer::address_of(market_signer);
+
+        let listed_items_data = borrow_global_mut<ListedItemsData>(market_signer_address);
+        let listed_items = &mut listed_items_data.listed_items;
+        let listed_item = table::borrow_mut(listed_items, token_id);
+
+        event::emit_event<DelistEvent>(
+            &mut listed_items_data.delisting_events,
+            DelistEvent { 
+                id: token_id, 
+                amount: listed_item.amount,
+                listing_id: listed_item.listing_id,
+                timestamp: timestamp::now_seconds(),
+                seller_address: sender_addr 
+            },
+        );
+
+        let token = option::extract(&mut listed_item.locked_token);
+        token::deposit_token(sender, token);
+
+        let ListedItem {amount: _, timestamp: _, locked_token, seller_address: _, listing_id: _} = table::remove(listed_items, token_id);
+        option::destroy_none(locked_token);
+    }
+
+    public entry fun batch_delist_token(
+        sender: &signer,
+        creators: vector<address>,
+        collection_names: vector<String>,
+        token_names: vector<String>,
+        property_versions: vector<u64>
+    ) acquires ListedItemsData, TokenCap {
+
+        let length_creators = vector::length(&creators);
+        let length_collections = vector::length(&collection_names);
+        let length_token_names = vector::length(&token_names);
+        let length_properties = vector::length(&property_versions);
+
+        assert!(length_collections == length_creators
+            && length_creators == length_token_names
+            && length_token_names == length_properties, ERROR_NOT_ENOUGH_LENGTH);
+
+        let i = length_token_names;
+
+        while (i > 0) {
+            let creator = vector::pop_back(&mut creators);
+            let collection_name = vector::pop_back(&mut collection_names);
+            let token_name = vector::pop_back(&mut token_names);
+            let property_version = vector::pop_back(&mut property_versions);
+
+            let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
+            delist_token(sender, token_id);
+
+            i = i - 1;
+        }
+    }
+
+    // part of the fixed price sale flow
+    fun buy_token<CoinType>(
+        sender: &signer, 
+        token_id: TokenId,
+    ) acquires ListedItemsData, TokenCap, MarketData {
+        let sender_addr = signer::address_of(sender);
+
+        let market_cap = &borrow_global<TokenCap>(@admin).cap;
+        let market_signer = &account::create_signer_with_capability(market_cap);
+        let market_signer_address = signer::address_of(market_signer);
+        let market_data = borrow_global_mut<MarketData>(market_signer_address);
+
+        let listed_items_data = borrow_global_mut<ListedItemsData>(market_signer_address);
+        let listed_items = &mut listed_items_data.listed_items;
+        let listed_item = table::borrow_mut(listed_items, token_id);
+        let seller = listed_item.seller_address;
+
+        assert!(sender_addr != seller, ERROR_INVALID_BUYER);
+
+        let royalty = token::get_royalty(token_id);
+        let royalty_payee = token::get_royalty_payee(&royalty);
+        let royalty_numerator = token::get_royalty_numerator(&royalty);
+        let royalty_denominator = token::get_royalty_denominator(&royalty);
+
+        let _fee_royalty: u64 = 0;
+
+        if (royalty_denominator == 0){
+            _fee_royalty = 0;
+        } else {
+            _fee_royalty = royalty_numerator * listed_item.amount / royalty_denominator;
+        };
+
+        let fee_listing = listed_item.amount * market_data.fee / 10000;
+        let sub_amount = listed_item.amount - fee_listing - _fee_royalty;
+
+        if (_fee_royalty > 0) {
+            coin::transfer<CoinType>(sender, royalty_payee, _fee_royalty);
+        };
+
+        if (fee_listing > 0) {
+            coin::transfer<CoinType>(sender, market_data.fund_address, fee_listing);
+        };
+
+        coin::transfer<CoinType>(sender, seller, sub_amount);
+
+        let token = option::extract(&mut listed_item.locked_token);
+        token::deposit_token(sender, token);
+
+        event::emit_event<BuyEvent>(
+            &mut listed_items_data.buying_events,
+            BuyEvent { 
+                id: token_id, 
+                listing_id: listed_item.listing_id,
+                seller_address: listed_item.seller_address,
+                timestamp: timestamp::now_seconds(),
+                buyer_address: sender_addr 
+            },
+        );
+
+        let ListedItem {amount: _, timestamp: _, locked_token, seller_address: _, listing_id: _} = table::remove(listed_items, token_id);
+        option::destroy_none(locked_token);
+    }
+
+    // batch buy script
+	public entry fun batch_buy_token<CoinType>(
+        sender: &signer,
+        creators: vector<address>,
+        collection_names: vector<String>,
+        token_names: vector<String>,
+        property_versions: vector<u64>
+    ) acquires ListedItemsData, TokenCap, MarketData {
+        let length_creators = vector::length(&creators);
+        let length_collections = vector::length(&collection_names);
+        let length_token_names = vector::length(&token_names);
+        let length_properties = vector::length(&property_versions);
+
+        assert!(length_collections == length_creators
+                && length_creators == length_token_names
+                && length_token_names == length_properties, ERROR_NOT_ENOUGH_LENGTH);
+
+        let i = length_token_names;
+
+        while (i > 0){
+            let creator = vector::pop_back(&mut creators);
+            let collection_name = vector::pop_back(&mut collection_names);
+            let token_name = vector::pop_back(&mut token_names);
+            let property_version = vector::pop_back(&mut property_versions);
+            let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
+
+            buy_token<CoinType>(sender, token_id);
+
+            i = i - 1;
+        }
+	}
+
 }
