@@ -8,7 +8,6 @@ module admin::marketplace {
     use std::signer;
     use std::option::{Self, Option};
     use std::string::String;
-    use std::vector;
     use aptos_std::event::{Self, EventHandle};
     use aptos_std::table::{Self, Table};
 
@@ -90,19 +89,22 @@ module admin::marketplace {
 
 
     // public contract && initial resource account
-    public entry fun initial_market_script(sender: &signer) {
+    public entry fun initial_market(sender: &signer) {
         let sender_addr = signer::address_of(sender);
+        //create resource account for market
         let (market_signer, market_cap) = account::create_resource_account(sender, x"01");
         let market_signer_address = signer::address_of(&market_signer);
 
         assert!(sender_addr == @admin, ERROR_INVALID_OWNER);
 
+        //if the market does not exist, create it and move the TokenCap to it (create storage for the token cap)
         if(!exists<TokenCap>(@admin)){
             move_to(sender, TokenCap {
                 cap: market_cap
             })
         };
 
+        //if the market does not exist, create it and move the MarketData to it (create storage for the market data)
         if (!exists<MarketData>(market_signer_address)){
             move_to(&market_signer, MarketData {
                 fee: 200,
@@ -110,6 +112,8 @@ module admin::marketplace {
             })
         };
 
+        //if the market does not exist, create it and move the ListedItemsData to it (create storage for the listed items data)
+        //move_to để tạo storage -> lưu trữ những thứ cần dùng, VD: listed_items này là table chứa các token đã được list (token đc rút ra từ sender và lưu vào table này, sau đó token sẽ đc lock lại)
         if (!exists<ListedItemsData>(market_signer_address)) {
             move_to(&market_signer, ListedItemsData {
                 listed_items:table::new<TokenId, ListedItem>(),
@@ -133,10 +137,12 @@ module admin::marketplace {
         let market_signer = &account::create_signer_with_capability(market_cap);
         let market_signer_address = signer::address_of(market_signer);
 
+        //withdraw token from sender and get listed items
         let token = token::withdraw_token(sender, token_id, 1);
         let listed_items_data = borrow_global_mut<ListedItemsData>(market_signer_address);
         let listed_items = &mut listed_items_data.listed_items;
 
+        //royalties for the token
         let royalty = token::get_royalty(token_id);
         let royalty_payee = token::get_royalty_payee(&royalty);
         let royalty_numerator = token::get_royalty_numerator(&royalty);
@@ -146,6 +152,7 @@ module admin::marketplace {
         let guid = account::create_guid(market_signer);
         let listing_id = guid::creation_num(&guid);
 
+        //emit list event
         event::emit_event<ListEvent>(
             &mut listed_items_data.listing_events,
             ListEvent { 
@@ -160,6 +167,8 @@ module admin::marketplace {
             },
         );
 
+        //use option to lock token then add it to table. resource account is not used to hold token in this contract
+        //instead of it, the token is locked in the table
         table::add(listed_items, token_id, ListedItem {
             amount: price,
             listing_id,
@@ -169,44 +178,11 @@ module admin::marketplace {
         })
     }
 
-    // entry batch list script by token owners
-    public entry fun batch_list_token(
-        sender: &signer,
-        creators: vector<address>,
-        collection_names: vector<String>,
-        token_names: vector<String>,
-        property_versions: vector<u64>,
-        prices: vector<u64>
-    ) acquires ListedItemsData, TokenCap {
-
-        let length_creators = vector::length(&creators);
-        let length_collections = vector::length(&collection_names);
-        let length_token_names = vector::length(&token_names);
-        let length_prices = vector::length(&prices);
-        let length_properties = vector::length(&property_versions);
-
-        assert!(length_collections == length_creators
-            && length_creators == length_token_names
-            && length_token_names == length_prices
-            && length_prices == length_properties, ERROR_NOT_ENOUGH_LENGTH);
-
-        let i = length_properties;
-
-        while (i > 0) {
-            //get the last element from vectors
-            let creator = vector::pop_back(&mut creators);
-            let token_name = vector::pop_back(&mut token_names);
-            let collection_name = vector::pop_back(&mut collection_names);
-            let price = vector::pop_back(&mut prices);
-            let property_version = vector::pop_back(&mut property_versions);
-
-            let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
-
-            list_token(sender, token_id, price);
-
-            i = i - 1;
-        }
+    public entry fun list_token_script(sender: &signer, creator: address, collection_name: String, token_name: String, property_version: u64, price: u64) acquires ListedItemsData, TokenCap {
+        let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
+        list_token(sender, token_id, price);
     }
+
     // delist token
     fun delist_token(
         sender: &signer,
@@ -217,6 +193,7 @@ module admin::marketplace {
         let market_signer = &account::create_signer_with_capability(market_cap);
         let market_signer_address = signer::address_of(market_signer);
 
+        //get listed items
         let listed_items_data = borrow_global_mut<ListedItemsData>(market_signer_address);
         let listed_items = &mut listed_items_data.listed_items;
         let listed_item = table::borrow_mut(listed_items, token_id);
@@ -235,43 +212,17 @@ module admin::marketplace {
         let token = option::extract(&mut listed_item.locked_token);
         token::deposit_token(sender, token);
 
+        //remove token from table and destroy it from the option which is locked before
         let ListedItem {amount: _, timestamp: _, locked_token, seller_address: _, listing_id: _} = table::remove(listed_items, token_id);
         option::destroy_none(locked_token);
     }
 
-    public entry fun batch_delist_token(
-        sender: &signer,
-        creators: vector<address>,
-        collection_names: vector<String>,
-        token_names: vector<String>,
-        property_versions: vector<u64>
-    ) acquires ListedItemsData, TokenCap {
-
-        let length_creators = vector::length(&creators);
-        let length_collections = vector::length(&collection_names);
-        let length_token_names = vector::length(&token_names);
-        let length_properties = vector::length(&property_versions);
-
-        assert!(length_collections == length_creators
-            && length_creators == length_token_names
-            && length_token_names == length_properties, ERROR_NOT_ENOUGH_LENGTH);
-
-        let i = length_token_names;
-
-        while (i > 0) {
-            let creator = vector::pop_back(&mut creators);
-            let collection_name = vector::pop_back(&mut collection_names);
-            let token_name = vector::pop_back(&mut token_names);
-            let property_version = vector::pop_back(&mut property_versions);
-
-            let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
-            delist_token(sender, token_id);
-
-            i = i - 1;
-        }
+    public entry fun delist_token_script(sender: &signer, creator: address, collection_name: String, token_name: String, property_version: u64) acquires ListedItemsData, TokenCap {
+        let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
+        delist_token(sender, token_id);
     }
-
-    // part of the fixed price sale flow
+    
+    // internal buy token function 
     fun buy_token<CoinType>(
         sender: &signer, 
         token_id: TokenId,
@@ -314,11 +265,14 @@ module admin::marketplace {
             coin::transfer<CoinType>(sender, market_data.fund_address, fee_listing);
         };
 
+        // transfer coin to buyer
         coin::transfer<CoinType>(sender, seller, sub_amount);
 
+        //get token from locked token
         let token = option::extract(&mut listed_item.locked_token);
         token::deposit_token(sender, token);
 
+        //emit buy event
         event::emit_event<BuyEvent>(
             &mut listed_items_data.buying_events,
             BuyEvent { 
@@ -330,40 +284,15 @@ module admin::marketplace {
             },
         );
 
+        //destroy none -> destroy locked token from listed item
         let ListedItem {amount: _, timestamp: _, locked_token, seller_address: _, listing_id: _} = table::remove(listed_items, token_id);
         option::destroy_none(locked_token);
     }
 
-    // batch buy script
-	public entry fun batch_buy_token<CoinType>(
-        sender: &signer,
-        creators: vector<address>,
-        collection_names: vector<String>,
-        token_names: vector<String>,
-        property_versions: vector<u64>
-    ) acquires ListedItemsData, TokenCap, MarketData {
-        let length_creators = vector::length(&creators);
-        let length_collections = vector::length(&collection_names);
-        let length_token_names = vector::length(&token_names);
-        let length_properties = vector::length(&property_versions);
 
-        assert!(length_collections == length_creators
-                && length_creators == length_token_names
-                && length_token_names == length_properties, ERROR_NOT_ENOUGH_LENGTH);
-
-        let i = length_token_names;
-
-        while (i > 0){
-            let creator = vector::pop_back(&mut creators);
-            let collection_name = vector::pop_back(&mut collection_names);
-            let token_name = vector::pop_back(&mut token_names);
-            let property_version = vector::pop_back(&mut property_versions);
-            let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
-
-            buy_token<CoinType>(sender, token_id);
-
-            i = i - 1;
-        }
-	}
+    public entry fun buy_token_script<CoinType>(sender: &signer, creator: address, collection_name: String, token_name: String, property_version: u64) acquires ListedItemsData, TokenCap, MarketData{
+        let token_id = token::create_token_id_raw(creator, collection_name, token_name, property_version);
+        buy_token<CoinType>(sender, token_id);
+    }
 
 }
