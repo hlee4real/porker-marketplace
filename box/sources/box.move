@@ -222,7 +222,7 @@ module admin::box {
 
     fun rand_u64_in_range(high: u64) : u64 {
         assert!(high > 0, E_HIGH_ARG_GREATER_THAN_LOW_ARG);
-        let value = timestamp::now_microseconds();
+        let value = timestamp::now_seconds();
         ( value % (high - 0)) + 0
     }
 
