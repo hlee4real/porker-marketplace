@@ -1,0 +1,13 @@
+[package]
+name = 'box'
+version = '1.0.0'
+[dependencies.AptosFramework]
+git = 'https://github.com/aptos-labs/aptos-core.git'
+rev = 'main'
+subdir = 'aptos-move/framework/aptos-framework'
+[dependencies.AptosToken]
+git = 'https://github.com/aptos-labs/aptos-core.git'
+rev = 'main'
+subdir = 'aptos-move/framework/aptos-token'
+[addresses]
+admin = 'd327357c4974f8dde28ecc9c8ae866f27c0644c1498d02054768dba492a2a365'
