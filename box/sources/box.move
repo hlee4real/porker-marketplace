@@ -195,9 +195,11 @@ module admin::box {
         let length = vector::length(&tokens_vector);
         let random_number = rand_u64_in_range(length);
         let token_id_value = vector::borrow_mut(&mut tokens_vector, random_number);
-        vector::remove(&mut tokens_vector, random_number);
         let token_name = string::utf8(MAIN_TOKEN_NAME);
         string::append(&mut token_name, u64_to_string(*token_id_value));
+
+        //remove token number from vector
+        vector::remove(&mut tokens_vector, random_number);
 
         let token_id = token::create_token_id_raw(resource_address, string::utf8(MAIN_COLLECTION_NAME), token_name, 0);
         token::transfer(&resource_signer, token_id, sender_addr, 1);
@@ -221,10 +223,12 @@ module admin::box {
         string::utf8(buffer)
     }
 
+    //use to random to get index of token
     fun rand_u64_in_range(high: u64) : u64 {
-        assert!(high > 0, E_HIGH_ARG_GREATER_THAN_LOW_ARG);
+        let len = high - 1;
+        assert!(len > 0, E_HIGH_ARG_GREATER_THAN_LOW_ARG);
         let value = timestamp::now_seconds();
-        ( value % (high - 0)) + 0
+        ( value % (len - 0)) + 0
     }
 
 }
