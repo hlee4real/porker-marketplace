@@ -195,6 +195,7 @@ module admin::box {
         let length = vector::length(&tokens_vector);
         let random_number = rand_u64_in_range(length);
         let token_id_value = vector::borrow_mut(&mut tokens_vector, random_number);
+        vector::remove(&mut tokens_vector, random_number);
         let token_name = string::utf8(MAIN_TOKEN_NAME);
         string::append(&mut token_name, u64_to_string(*token_id_value));
 
